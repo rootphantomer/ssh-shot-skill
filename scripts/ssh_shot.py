@@ -4,10 +4,12 @@
 ssh_shot.py —— SSH 远程执行命令 + 输出截图取证
 
 用途: 给一组 SSH 凭据和命令, 逐条在远端执行, 把每条命令的完整输出(含 ANSI 颜色)
-      交给 termshot 渲染成一张 PNG 截图, 并生成 manifest.json 供审计/取证归档。
+      交给 termshot 渲染成终端风格截图, 再按需转成 png/jpg/jpeg/webp/bmp,
+      并生成 manifest.json 供审计/取证归档。
 
 依赖:
     paramiko           (pip install paramiko)
+    Pillow >= 10       (非 PNG 格式需要, pip install 'Pillow>=10')
     termshot >= 0.4    (go install github.com/homeport/termshot/cmd/termshot@latest
                         或 brew install homeport/tap/termshot)
 
@@ -25,6 +27,9 @@ ssh_shot.py —— SSH 远程执行命令 + 输出截图取证
     # 私钥登录 + 自定义终端宽度
     ./ssh_shot.py --host 10.0.0.5 -i ~/.ssh/id_ed25519 --cols 160 -c "systemctl status sshd"
 
+    # 批量服务器: 清单每行 `ip user password`, 输出目录只有图片 {ip}_{目录名}
+    ./ssh_shot.py --hosts-file hosts.txt --commands-json cmds.json -o ./巡检报告
+
 退出码:
     0 全部成功    1 部分命令失败/超时    2 参数或环境错误(如 termshot 缺失)
 """
@@ -32,6 +37,7 @@ ssh_shot.py —— SSH 远程执行命令 + 输出截图取证
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -41,6 +47,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -64,10 +71,24 @@ DEFAULT_TERMSHOT_CANDIDATES = (
     "/usr/bin/termshot",
 )
 
+# 用户可选输出格式 -> (文件后缀, termshot/Pillow 实际格式)
+# termshot 只能出 PNG, 所以先渲染到临时 PNG, 再由 Pillow 转目标格式。
+IMAGE_FORMATS = {
+    "png": (".png", "PNG"),
+    "jpg": (".jpg", "JPEG"),
+    "jpeg": (".jpg", "JPEG"),
+    "webp": (".webp", "WEBP"),
+    "bmp": (".bmp", "BMP"),
+}
+
+# 自适应列数范围: 下限避免短输出字过大, 上限防止单行过长导致画面过宽
+MIN_COLS, MAX_COLS = 45, 120
+
 # 终端里需要清掉、但 termshot 解析不了的转义序列(OSC / DCS / 私有模式等)
 _OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _DCS_RE = re.compile(r"\x1b[P^_][^\x1b]*\x1b\\")
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]")
+_SGR_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 # --------------------------------------------------------------------------- #
@@ -108,7 +129,8 @@ class Result:
     duration: float = 0.0
     output_bytes: int = 0
     ansi_file: str = ""
-    png_file: str = ""
+    image_file: str = ""
+    columns: int = 0
     error: str = ""
     timed_out: bool = False
     local_script: str = ""
@@ -155,12 +177,10 @@ def sanitize_output(text: str, keep_cr: bool) -> str:
     return text.rstrip("\n") + "\n"
 
 
-def build_header(task: Task, idx: int, total: int, user: str, host: str) -> str:
-    """自描述头: 便于截图单独成证时也能看出是哪台机器、哪条命令。"""
-    tag = f"[{task.id}] {task.name}"
+def build_header(task: Task, user: str, host: str) -> str:
+    """自描述头: 保留命令原文(提示符)与脚本来源, 不额外加行号标签。"""
     prompt = f"{user}@{host}:~$ {task.command}"
     head = (
-        f"\x1b[1;36m{tag}  ({idx}/{total})\x1b[0m\n"
         f"\x1b[1;32m{user}@{host}\x1b[0m:\x1b[1;34m~\x1b[0m$ "
         f"\x1b[1;37m{task.command}\x1b[0m\n"
     )
@@ -181,6 +201,19 @@ def build_footer(res: Result) -> str:
         return f"\x1b[1;31m[error: {res.error}]\x1b[0m\n"
     color = "32" if res.exit_status == 0 else "31"
     return f"\x1b[1;{color}m[exit {res.exit_status}]  ({res.duration:.2f}s)\x1b[0m\n"
+
+
+def build_aggregate_footer(results: list[Result]) -> str:
+    """--merge 用: 整批命令只输出一个汇总 footer(最差状态 + 总耗时)。"""
+    total = sum(r.duration for r in results)
+    if any(r.timed_out for r in results):
+        return f"\x1b[1;33m[timeout after {total:.1f}s]\x1b[0m\n"
+    errored = next((r for r in results if r.error), None)
+    if errored:
+        return f"\x1b[1;31m[error: {errored.error}]\x1b[0m\n"
+    bad = next((r.exit_status for r in results if r.exit_status not in (0, None)), 0)
+    color = "32" if bad == 0 else "31"
+    return f"\x1b[1;{color}m[exit {bad}]  ({total:.2f}s)\x1b[0m\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -474,16 +507,138 @@ def run_task(client: paramiko.SSHClient, task: Task, args: argparse.Namespace) -
 # --------------------------------------------------------------------------- #
 # 渲染
 # --------------------------------------------------------------------------- #
-def render(termshot: str, ansi_path: Path, png_path: Path, args: argparse.Namespace) -> tuple[bool, str]:
-    cmd = [termshot, "--raw-read", str(ansi_path), "--filename", str(png_path)]
+def adaptive_columns(ansi_path: Path, explicit: int) -> int:
+    """按 ANSI 输出里最长可见行算列数, 夹在 [MIN_COLS, MAX_COLS]; explicit>0 时手动覆盖。"""
+    if explicit > 0:
+        return explicit
+    text = ansi_path.read_text(encoding="utf-8", errors="replace")
+    text = _OSC_RE.sub("", text)
+    text = _DCS_RE.sub("", text)
+    text = _SGR_RE.sub("", text)
+    text = _CTRL_RE.sub("", text)
+    longest = max((len(line) for line in text.splitlines()), default=0)
+    return max(MIN_COLS, min(MAX_COLS, longest + 2))
+
+
+def detect_screen_px() -> int | None:
+    """本机最大屏幕的物理像素宽度(优先); macOS/通用, Linux 回退 xrandr/xdpyinfo。"""
+    try:  # macOS: system_profiler 报物理像素, Retina 下比 AppleScript 的逻辑点大一倍
+        out = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                             capture_output=True, text=True, timeout=12).stdout
+        widths = [int(m.group(1)) for m in re.finditer(r"Resolution:\s*(\d+)\s*x\s*\d+", out)]
+        if widths:
+            return max(widths)
+    except Exception:  # noqa: BLE001
+        pass
+    try:  # macOS 逻辑点回退
+        out = subprocess.run(
+            ["osascript", "-e", 'tell application "Finder" to get bounds of window of desktop'],
+            capture_output=True, text=True, timeout=12,
+        ).stdout.strip()
+        parts = [int(x.strip()) for x in out.split(",")]
+        if len(parts) == 4 and parts[2] > 0:
+            return parts[2]
+    except Exception:  # noqa: BLE001
+        pass
+    try:  # Linux: xrandr 当前模式
+        out = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=8).stdout
+        widths = [int(m.group(1)) for m in re.finditer(r"(\d+)x\d+\s+[\d.]+\*", out)]
+        if widths:
+            return max(widths)
+    except Exception:  # noqa: BLE001
+        pass
+    try:  # Linux: xdpyinfo
+        out = subprocess.run(["xdpyinfo"], capture_output=True, text=True, timeout=8).stdout
+        m = re.search(r"dimensions:\s*(\d+)x", out)
+        if m:
+            return int(m.group(1))
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def detect_terminal_cols() -> int | None:
+    """当前终端列数; 非 TTY 时读 COLUMNS, 都拿不到返回 None。"""
+    env = os.environ.get("COLUMNS", "").strip()
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    cols = shutil.get_terminal_size(fallback=(0, 0)).columns
+    return cols if cols > 0 else None
+
+
+def calibrate_px_per_col(termshot: str, args: argparse.Namespace, tmpdir: Path) -> tuple[float, float] | None:
+    """渲染两个探针(20/40 列)求 px = slope*列数 + intercept, 抵消字体/版本差异。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    probe = tmpdir / ".calib.ansi"
+    probe.write_text("X\n", encoding="utf-8")
+    widths: list[int] = []
+    try:
+        for cols in (20, 40):
+            png = tmpdir / f".calib{cols}.png"
+            ok, _ = render(termshot, probe, png, cols, args)
+            if not ok:
+                return None
+            with Image.open(png) as im:
+                widths.append(im.size[0])
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        for p in (probe, tmpdir / ".calib20.png", tmpdir / ".calib40.png"):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+    slope = (widths[1] - widths[0]) / 20
+    return (slope, widths[0] - slope * 20) if slope > 0 else None
+
+
+def resolve_target_columns(termshot: str | None, args: argparse.Namespace,
+                           out_dir: Path) -> tuple[int | None, dict]:
+    """按 --width-source 定列数; 返回 (列数或 None 表示逐图自适应, 写入清单的信息)。"""
     if args.render_columns > 0:
-        cmd += ["--columns", str(args.render_columns)]
-    if args.margin is not None:
-        cmd += ["--margin", str(args.margin)]
+        return args.render_columns, {"source": "manual", "columns": args.render_columns}
+    source = args.width_source
+    term_cols = target_px = None
+    if source == "terminal":
+        term_cols = detect_terminal_cols()
+        if not term_cols:
+            target_px = detect_screen_px()
+            if target_px:
+                source = "screen(fallback)"
+    else:  # screen
+        target_px = detect_screen_px()
+        if not target_px:
+            term_cols = detect_terminal_cols()
+            if term_cols:
+                source = "terminal(fallback)"
+    if term_cols:
+        return term_cols, {"source": source, "terminal_cols": term_cols}
+    if target_px:
+        cal = calibrate_px_per_col(termshot, args, out_dir) if termshot else None
+        if cal and cal[0] > 0:
+            cols = round((target_px - cal[1]) / cal[0])
+            px_per_col = round(cal[0], 2)
+        else:  # 经验值兜底(本机实测 28.9px/列 + 97px 固定开销)
+            cols = round((target_px - 97) / 28.9)
+            px_per_col = None
+        cols = max(MIN_COLS, min(500, cols))
+        return cols, {"source": source, "screen_px": target_px,
+                      "px_per_col": px_per_col, "columns": cols}
+    return None, {"source": "content"}
+
+
+def render(termshot: str, ansi_path: Path, png_path: Path, cols: int,
+           args: argparse.Namespace) -> tuple[bool, str]:
+    cmd = [
+        termshot, "--raw-read", str(ansi_path), "--filename", str(png_path),
+        "--columns", str(cols),
+        "--clip-canvas", "--no-shadow",  # 终端框铺满画布, 无阴影、无外部背景
+    ]
     if args.padding is not None:
         cmd += ["--padding", str(args.padding)]
-    if args.no_shadow:
-        cmd.append("--no-shadow")
     if args.no_decoration:
         cmd.append("--no-decoration")
     try:
@@ -498,13 +653,79 @@ def render(termshot: str, ansi_path: Path, png_path: Path, args: argparse.Namesp
     return True, ""
 
 
-def main(argv: list[str] | None = None) -> int:
+def parse_color(spec: str) -> tuple[int, int, int] | None:
+    """解析 #RRGGBB / #RGB / RRGGBB, 非法返回 None。"""
+    s = (spec or "").strip().lower()
+    hexpart = s[1:] if s.startswith("#") else s
+    if len(hexpart) == 3:
+        hexpart = "".join(ch * 2 for ch in hexpart)
+    if len(hexpart) == 6:
+        try:
+            return tuple(int(hexpart[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_background(spec: str, rgba) -> tuple[int, int, int]:
+    """给无 alpha 的格式挑底色: auto 取图上最常见的完全不透明色(termshot 是深灰)。"""
+    s = (spec or "auto").strip().lower()
+    if s == "auto":
+        colors = rgba.getcolors(maxcolors=rgba.width * rgba.height) or []
+        opaque = [(n, c) for n, c in colors if len(c) == 4 and c[3] == 255]
+        if opaque:
+            return max(opaque, key=lambda x: x[0])[1][:3]
+        return (0, 0, 0)
+    if s == "black":
+        return (0, 0, 0)
+    if s == "white":
+        return (255, 255, 255)
+    parsed = parse_color(s)
+    if parsed is not None:
+        return parsed
+    raise ValueError(f"无法识别的底色: {spec!r} (可用 auto/black/white/#RRGGBB)")
+
+
+def convert_image(src: Path, dst: Path, args: argparse.Namespace) -> tuple[bool, str]:
+    """把 termshot 的临时 PNG 转成目标格式; 画布宽度已由 termshot 列数决定, 不再补背景。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        return False, "缺少 Pillow, 请安装: uv pip install --python .venv/bin/python 'Pillow>=10'"
+    fmt = IMAGE_FORMATS[args.image_format][1]
+    try:
+        with Image.open(src) as raw:
+            rgba = raw.convert("RGBA")
+            if fmt in ("PNG", "WEBP"):
+                if fmt == "PNG":
+                    rgba.save(dst, format="PNG")
+                else:
+                    rgba.save(dst, format="WEBP", quality=args.image_quality, method=6)
+            else:
+                bg = resolve_background(args.image_background, rgba)
+                flat = Image.new("RGB", rgba.size, bg)
+                flat.paste(rgba, mask=rgba.getchannel("A"))
+                if fmt == "JPEG":
+                    flat.save(dst, format="JPEG", quality=args.image_quality,
+                              optimize=True, subsampling=0)
+                else:
+                    flat.save(dst, format="BMP")
+    except Exception as exc:  # noqa: BLE001
+        return False, f"图片转换失败: {exc}"
+    if not dst.is_file() or dst.stat().st_size == 0:
+        return False, "图片转换未生成文件"
+    return True, ""
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ssh_shot.py",
-        description="SSH 远程执行命令并用 termshot 把每条输出渲染成 PNG 截图取证",
+        description="SSH 远程执行命令并把每条输出渲染成终端风格截图取证 (png/jpg/jpeg/webp/bmp)",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    p.add_argument("--host", required=True, help="目标主机 IP/域名")
+    p.add_argument("--host", default=None, help="目标主机 IP/域名 (与 --hosts-file 二选一)")
+    p.add_argument("--hosts-file", default=None, metavar="FILE",
+                   help="主机清单纯文本 (每行: ip user password); 批量执行同一批命令")
     p.add_argument("--port", type=int, default=22, help="SSH 端口 (默认 22)")
     p.add_argument("--user", "-u", default="root", help="SSH 用户名 (默认 root)")
     p.add_argument("--password", "-p", default=None, help="SSH 密码; 不传则交互输入")
@@ -538,14 +759,116 @@ def main(argv: list[str] | None = None) -> int:
 
     p.add_argument("--termshot", default=None, help="termshot 可执行文件路径")
     p.add_argument("--no-render", action="store_true", help="只保存 .ansi 文本, 不出图")
-    p.add_argument("--render-columns", type=int, default=0, help="出图时强制换行列数 (0=不强制)")
-    p.add_argument("--margin", type=int, default=None, help="图片外边距像素")
+    p.add_argument("--render-columns", type=int, default=0,
+                   help="手动指定列数 (0=按 --width-source 决定)")
+    p.add_argument("--width-source", choices=("screen", "terminal"), default="screen",
+                   help="宽度基准: screen=屏幕物理像素(默认), terminal=当前终端列数")
+    p.add_argument("--merge", action="store_true",
+                   help="多条命令按序执行后, 把输出拼成一张图(不生成单条图)")
     p.add_argument("--padding", type=int, default=None, help="图片内边距像素")
-    p.add_argument("--no-shadow", action="store_true", help="不画窗口阴影")
     p.add_argument("--no-decoration", action="store_true", help="不画窗口标题栏按钮")
     p.add_argument("--render-timeout", type=int, default=90, help="单张渲染超时秒数")
+    p.add_argument("--image-format", choices=sorted(IMAGE_FORMATS), default="jpeg",
+                   help="截图格式: png/jpg/jpeg/webp/bmp (默认 jpeg; jpg 与 jpeg 同为 .jpg)")
+    p.add_argument("--image-quality", type=int, default=90,
+                   help="有损格式质量 1-100, 默认 90 (对 jpg/jpeg/webp 生效)")
+    p.add_argument("--image-background", default="auto",
+                   help="图片底色: auto/black/white/#RRGGBB (默认 auto, 取截图自带的深色)")
     p.add_argument("--ask-key-passphrase", action="store_true", help="使用私钥时交互索要口令")
-    args = p.parse_args(argv)
+    return p
+
+
+def parse_hosts_file(path: str) -> list[tuple[str, str, str]]:
+    """解析纯文本主机清单: 每行 `ip user password`, 忽略空行与 # 注释。"""
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise SystemExit(f"[!] 主机清单不存在: {p}")
+    hosts: list[tuple[str, str, str]] = []
+    for lineno, raw in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 3:
+            raise SystemExit(
+                f"[!] 主机清单第 {lineno} 行格式错误 (应为: ip user password): {raw!r}"
+            )
+        hosts.append((parts[0], parts[1], parts[2]))
+    if not hosts:
+        raise SystemExit(f"[!] 主机清单为空: {p}")
+    return hosts
+
+
+def run_batch(args: argparse.Namespace) -> int:
+    """批量模式: 对清单里每台主机执行同一批命令, 每主机只留一张图, 命名为 {ip}_{目录名}。"""
+    hosts = parse_hosts_file(args.hosts_file)
+    out_root = Path(args.output).expanduser()
+    out_root.mkdir(parents=True, exist_ok=True)  # 不存在则新建
+    dir_name = out_root.name or out_root.resolve().name  # 图片名中的“目录名”
+    ext = IMAGE_FORMATS[args.image_format][0]
+
+    eprint(f"[*] 批量模式: {len(hosts)} 台主机, 输出到 {out_root} (图片名: {{ip}}_{dir_name}{ext})")
+    ok_hosts = failed_hosts = 0
+    for ip, user, password in hosts:
+        eprint(f"\n===== {ip} ({user}) =====")
+        # 每台主机先在临时目录里跑完整采集, 再把最终图片搬到 out_root, 删除临时目录
+        with tempfile.TemporaryDirectory(prefix="ssh_shot_batch_") as work:
+            cfg = copy.copy(args)
+            cfg.host = ip
+            cfg.user = user
+            cfg.password = password
+            cfg.key = None  # 批量模式用清单里的密码认证
+            cfg.merge = True  # 每主机强制拼成一张图
+            cfg.hosts_file = None
+            cfg.output = work
+            try:
+                rc = main(cfg)
+            except SystemExit as exc:  # connect() 认证/连接失败会抛 SystemExit
+                eprint(f"    [!] {ip} 连接失败: {exc}")
+                rc = 2
+            merged = None
+            if rc == 0:
+                candidates = list(Path(work).rglob(f"merged{ext}"))
+                merged = candidates[0] if candidates else None
+            if merged and merged.is_file():
+                # 图片名 = {ip}_{目录名}; ip 里的特殊字符做文件名安全化
+                safe_ip = re.sub(r"[^A-Za-z0-9._-]", "_", ip)
+                target = out_root / f"{safe_ip}_{dir_name}{ext}"
+                shutil.copyfile(merged, target)
+                eprint(f"    [✓] {target}")
+                ok_hosts += 1
+            else:
+                failed_hosts += 1
+                eprint(f"    [!] {ip} 采集失败 (退出码 {rc}), 未生成图片")
+
+    eprint(f"\n[*] 批量完成: 成功 {ok_hosts}/{len(hosts)}, 失败 {failed_hosts}")
+    eprint(f"[*] 输出目录: {out_root} (仅含 {ok_hosts} 张图片)")
+    return 0 if failed_hosts == 0 else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = build_parser()
+    args = argv if isinstance(argv, argparse.Namespace) else p.parse_args(argv)
+
+    if args.hosts_file and args.host:
+        p.error("--host 与 --hosts-file 不能同时使用")
+    if not args.hosts_file and not args.host:
+        p.error("必须指定 --host 或 --hosts-file")
+
+    if not 1 <= args.image_quality <= 100:
+        p.error("--image-quality 必须在 1-100 之间")
+    if not args.no_render and args.image_format in ("jpg", "jpeg", "bmp"):
+        bg = args.image_background.strip().lower()
+        if bg not in ("auto", "black", "white") and parse_color(bg) is None:
+            p.error("--image-background 需要 auto/black/white/#RRGGBB")
+    if not args.no_render:
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            p.error("出图需要 Pillow, 请先安装: uv pip install --python .venv/bin/python 'Pillow>=10'")
+
+    if args.hosts_file:
+        return run_batch(args)
 
     tasks = load_tasks(args)
 
@@ -562,10 +885,16 @@ def main(argv: list[str] | None = None) -> int:
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.output).expanduser() / f"{args.host}_{stamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    target_cols, width_info = resolve_target_columns(termshot, args, out_dir)
+    if target_cols:
+        eprint(f"[*] 宽度基准: {width_info} -> {target_cols} 列")
+    else:
+        eprint(f"[*] 宽度基准: 按输出自适应 ({MIN_COLS}-{MAX_COLS} 列)")
 
     eprint(f"[*] 连接 {args.user}@{args.host}:{args.port} ...")
     client = connect(args)
-    out_dir.mkdir(parents=True, exist_ok=True)
     eprint(f"[*] 已连接, 输出目录: {out_dir}")
 
     # ---------------- 脚本准备: 上传 / 探测 shebang ----------------
@@ -623,32 +952,77 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"[!] 脚本准备失败: {exc}")
 
     results: list[Result] = []
+    merged_parts: list[str] = []
     try:
         for idx, task in enumerate(tasks, 1):
             eprint(f"[{idx}/{len(tasks)}] {task.id}: {task.command.strip().splitlines()[0][:70]}")
             res, text = run_task(client, task, args)
-            body = build_header(task, idx, len(tasks), args.user, args.host)
+            body = build_header(task, args.user, args.host)
             body += sanitize_output(text, args.keep_cr)
-            body += build_footer(res)
 
+            # 单条 ansi 始终带自己的 footer(取证完整); merge 图稍后只在图尾放一个汇总 footer
             ansi_path = out_dir / f"{task.safe_id}.ansi"
-            ansi_path.write_text(body, encoding="utf-8")
+            ansi_path.write_text(body + build_footer(res), encoding="utf-8")
             res.ansi_file = ansi_path.name
-
-            if termshot:
-                png_path = out_dir / f"{task.safe_id}.png"
-                ok, err = render(termshot, ansi_path, png_path, args)
+            if args.merge:
+                merged_parts.append(body)
+            elif termshot:
+                tmp_png = out_dir / f".{task.safe_id}.termshot.png"
+                cols = target_cols or adaptive_columns(ansi_path, args.render_columns)
+                res.columns = cols
+                ok, err = render(termshot, ansi_path, tmp_png, cols, args)
                 if ok:
-                    res.png_file = png_path.name
+                    image_path = out_dir / f"{task.safe_id}{IMAGE_FORMATS[args.image_format][0]}"
+                    ok, err = convert_image(tmp_png, image_path, args)
+                    if ok:
+                        res.image_file = image_path.name
+                    else:
+                        res.error = res.error or err
+                        eprint(f"    [!] {err}")
                 else:
                     res.error = res.error or err
                     eprint(f"    [!] 出图失败: {err}")
+                try:
+                    tmp_png.unlink(missing_ok=True)
+                except OSError:
+                    pass
             elif not args.no_render:
                 res.error = res.error or "termshot 缺失"
 
             state = "ok" if res.ok else ("TIMEOUT" if res.timed_out else "FAIL")
             eprint(f"    -> {state}  exit={res.exit_status}  {res.duration:.2f}s  {res.output_bytes}B")
             results.append(res)
+
+        # --merge: 所有命令输出按序拼成一个 ANSI, 只在图尾放一个汇总 footer
+        if args.merge:
+            merged_ansi = out_dir / "merged.ansi"
+            merged_ansi.write_text(
+                "".join(merged_parts) + build_aggregate_footer(results), encoding="utf-8"
+            )
+            if termshot:
+                tmp_png = out_dir / ".merged.termshot.png"
+                cols = target_cols or adaptive_columns(merged_ansi, args.render_columns)
+                ok, err = render(termshot, merged_ansi, tmp_png, cols, args)
+                if ok:
+                    image_path = out_dir / f"merged{IMAGE_FORMATS[args.image_format][0]}"
+                    ok, err = convert_image(tmp_png, image_path, args)
+                    if ok:
+                        for r in results:
+                            r.columns = cols
+                            r.image_file = image_path.name
+                    else:
+                        err = f"图片转换失败: {err}"
+                eprint(f"    -> merged  exit=-  {cols} 列  {image_path.name if ok else err}")
+                if not ok:
+                    for r in results:
+                        r.error = r.error or err
+                try:
+                    tmp_png.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            elif not args.no_render:
+                for r in results:
+                    r.error = r.error or "termshot 缺失"
     finally:
         if sftp:
             try:
@@ -684,6 +1058,13 @@ def main(argv: list[str] | None = None) -> int:
             "pty": not args.no_pty,
             "cols": args.cols,
             "rows": args.rows,
+            "format": args.image_format,
+            "quality": args.image_quality if args.image_format in ("jpg", "jpeg", "webp") else None,
+            "background": args.image_background,
+            "clip_canvas": True,
+            "shadow": False,
+            "width_source": width_info,
+            "merge": args.merge,
         },
         "scripts": {
             "remote_dir": remote_dir if uploaded else None,

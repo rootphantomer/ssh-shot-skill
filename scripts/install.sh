@@ -3,13 +3,13 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-echo "==> 1/2 安装 paramiko"
+echo "==> 1/2 安装 Python 依赖 (paramiko + Pillow)"
 if command -v uv >/dev/null 2>&1; then
   uv venv .venv
-  uv pip install --python .venv/bin/python 'paramiko>=3.0'
+  uv pip install --python .venv/bin/python 'paramiko>=3.0' 'Pillow>=10'
 elif command -v python3 >/dev/null 2>&1; then
   python3 -m venv .venv
-  ./.venv/bin/python -m pip install -U pip 'paramiko>=3.0'
+  ./.venv/bin/python -m pip install -U pip 'paramiko>=3.0' 'Pillow>=10'
 else
   echo "[!] 找不到 uv 或 python3，请先安装 Python 3.9+" >&2
   exit 1

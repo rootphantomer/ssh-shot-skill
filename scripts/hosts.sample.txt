@@ -1,0 +1,6 @@
+# 主机清单: 每行 `ip user password`, # 开头为注释, 空行忽略
+# 批量模式: ./.venv/bin/python scripts/ssh_shot.py --hosts-file scripts/hosts.sample.txt \
+#              -c "uname -a" -c "id" -o ./巡检报告
+10.0.0.5 root YourPassword1
+10.0.0.6 ops  YourPassword2
+10.0.0.7 admin YourPassword3
