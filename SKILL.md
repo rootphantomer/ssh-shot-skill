@@ -1,11 +1,11 @@
 ---
 name: ssh-shot
-description: 通过 SSH 在远端 Linux/Unix 主机上执行命令或脚本，并把每条命令的完整输出（含 ANSI 颜色）用 termshot 渲染成终端风格 PNG 截图，同时生成 manifest.json 归档（命令原文、退出码、耗时、脚本 SHA-256）。适用于服务器巡检、安全基线核查、故障排查、应急响应验证、审计取证，以及任何需要「命令输出截图」作为证据的场合。Use when a task needs SSH command or script execution on a remote Linux/Unix host together with screenshot evidence: system inspection, security baseline checks, troubleshooting, incident-response verification, audit evidence collection, or when the user asks for command-output screenshots.
+description: "通过 SSH 在远端 Linux/Unix 主机上执行命令或脚本，并把每条命令的完整输出（含 ANSI 颜色）用 termshot 渲染成终端风格 PNG 截图，同时生成 manifest.json 归档（命令原文、退出码、耗时、脚本 SHA-256）。适用于服务器巡检、安全基线核查、故障排查、应急响应验证、审计取证，以及任何需要「命令输出截图」作为证据的场合。Use when a task needs SSH command or script execution on a remote Linux/Unix host together with screenshot evidence: system inspection, security baseline checks, troubleshooting, incident-response verification, audit evidence collection, or when the user asks for command-output screenshots."
 license: MIT
 compatibility: 需要本机 Python 3.9+、paramiko（或使用 scripts/install.sh 自动安装）、termshot CLI（Go，0.4+），以及到目标主机的 SSH 网络连通性与可用凭据。不依赖远端安装任何软件；Windows 需在 WSL 或 Git Bash 下运行。
 metadata:
   author: rootphantomer
-  version: "1.0"
+  version: "1.0.1"
   repository: https://github.com/rootphantomer/ssh-shot-skill
 ---
 
