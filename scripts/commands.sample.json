@@ -1,0 +1,32 @@
+[
+  {
+    "id": "row01",
+    "name": "basic-info",
+    "command": "hostname; uname -a; id",
+    "waitSeconds": 1
+  },
+  {
+    "id": "row02",
+    "name": "os-release",
+    "command": "cat /etc/os-release",
+    "waitSeconds": 1
+  },
+  {
+    "id": "row03",
+    "name": "account-check",
+    "command": "echo '--- /etc/passwd (tail) ---'; tail -n 10 /etc/passwd",
+    "waitSeconds": 1
+  },
+  {
+    "id": "row04",
+    "name": "listening-ports",
+    "command": "ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null || lsof -iTCP -sTCP:LISTEN -P -n",
+    "timeout": 30
+  },
+  {
+    "id": "row05",
+    "name": "auth-log-tail",
+    "command": "tail -n 20 /var/log/auth.log 2>/dev/null || tail -n 20 /var/log/secure 2>/dev/null || echo 'no auth log'",
+    "waitSeconds": 1
+  }
+]
