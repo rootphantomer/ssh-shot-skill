@@ -321,17 +321,35 @@ termshot --raw-read evidence/10.0.0.5_20261118-110852/row01.ansi \
 
 ## 作为 Agent Skill 使用
 
-本仓库同时是一个 [Agent Skill](SKILL.md)：根目录的 `SKILL.md` 描述了触发条件与调用约定，`description`
-字段覆盖了巡检、基线核查、应急响应、审计取证等中英文触发词。
+本仓库同时是一个符合 [Agent Skills 规范](https://agentskills.io/specification) 的技能包：
 
-安装到技能目录即可被 Agent 自动调用：
-
-```bash
-ln -s "$PWD" ~/.pi/agent/skills/ssh-shot          # pi
-ln -s "$PWD" ~/.claude/skills/ssh-shot            # Claude Code
+```text
+ssh-shot/
+├── SKILL.md                 # 技能定义：名称、触发条件、工作流、规则、自检清单
+├── references/              # 渐进式披露的细节，只在需要时加载
+│   ├── cli.md               # 完整参数、退出码、manifest 字段
+│   ├── troubleshooting.md   # 常见故障与处理
+│   └── playbooks.md         # 只读巡检命令组（基础/账号/网络/服务/日志/补丁）
+├── scripts/                 # 主程序、安装脚本、自测服务端、技能自校验
+└── README.md
 ```
 
-随后像这样使用 AI 侧调用（Agent 会自行组装命令）：
+`SKILL.md` 的 `name` 字段为 `ssh-shot`，按规范**目录名需与之一致**，因此克隆时指定目录名：
+
+```bash
+git clone https://github.com/rootphantomer/ssh-shot-skill.git ssh-shot
+ln -s "$PWD/ssh-shot" ~/.pi/agent/skills/ssh-shot      # pi
+ln -s "$PWD/ssh-shot" ~/.claude/skills/ssh-shot        # Claude Code
+```
+
+校验技能是否符合规范：
+
+```bash
+python3 scripts/validate_skill.py .
+# [ok] ssh-shot: SKILL.md 符合 Agent Skills 规范
+```
+
+随后即可用自然语言触发（Agent 会自行组装命令）：
 
 > 「登录 10.0.0.5，跑一遍账号与端口基线检查，把结果截图归档到 evidence/」
 
@@ -374,7 +392,12 @@ ln -s "$PWD" ~/.claude/skills/ssh-shot            # Claude Code
 1. Fork 本仓库并从 `main` 拉出特性分支；
 2. 保持提交信息清晰（推荐 Conventional Commits）；
 3. 涉及行为的改动请补充自测步骤或更新 `SKILL.md` / `README.md`；
-4. 提交前确认 `python3 -m py_compile scripts/ssh_shot.py` 通过。
+4. 提交前跑一遍自检：
+
+   ```bash
+   python3 -m py_compile scripts/ssh_shot.py scripts/validate_skill.py
+   python3 scripts/validate_skill.py .
+   ```
 
 ## 许可证
 

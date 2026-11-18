@@ -1,125 +1,118 @@
 ---
 name: ssh-shot
-description: 通过 SSH 在远端 Linux/Unix 主机执行命令或脚本，并用 termshot 把每条命令的完整输出（含 ANSI 颜色）渲染成 PNG 截图，同时生成 manifest.json 归档。当任务涉及服务器巡检、故障排查、安全基线核查、应急响应验证、审计取证、需要"命令输出截图证明"，或要求 SSH 执行命令/上传脚本并留痕时使用。Use whenever a Linux/Unix task needs SSH command execution with screenshot evidence, e.g. baseline checks, troubleshooting, incident-response verification, or audit evidence collection. Not for Excel/report editing alone.
-version: 1.0
-author: rootphantomer
+description: 通过 SSH 在远端 Linux/Unix 主机上执行命令或脚本，并把每条命令的完整输出（含 ANSI 颜色）用 termshot 渲染成终端风格 PNG 截图，同时生成 manifest.json 归档（命令原文、退出码、耗时、脚本 SHA-256）。适用于服务器巡检、安全基线核查、故障排查、应急响应验证、审计取证，以及任何需要「命令输出截图」作为证据的场合。Use when a task needs SSH command or script execution on a remote Linux/Unix host together with screenshot evidence: system inspection, security baseline checks, troubleshooting, incident-response verification, audit evidence collection, or when the user asks for command-output screenshots.
 license: MIT
+compatibility: 需要本机 Python 3.9+、paramiko（或使用 scripts/install.sh 自动安装）、termshot CLI（Go，0.4+），以及到目标主机的 SSH 网络连通性与可用凭据。不依赖远端安装任何软件；Windows 需在 WSL 或 Git Bash 下运行。
+metadata:
+  author: rootphantomer
+  version: "1.0"
+  repository: https://github.com/rootphantomer/ssh-shot-skill
 ---
 
-# SSH Shot — SSH 命令执行 + 输出截图取证
+# SSH Shot
 
-把「连上去跑命令」和「截图留证」合成一步：给凭据和目标，自动执行命令清单 / 本地脚本 / 远端脚本，
-每条输出渲染成一张终端风格 PNG，并把命令、退出码、耗时、脚本 sha256 记入 `manifest.json`。
+## Overview
 
-## 什么时候用
+将「SSH 执行命令」与「截图留证」合并为一次操作：连上目标主机，逐条执行命令或脚本，把每条输出渲染成一张终端风格 PNG，并输出一份可编程复核的 `manifest.json`。
 
-- 服务器巡检、基线核查、安全加固前后对比
-- 故障排查，需要留下"我确实跑过这条命令、结果是这样"的证据
-- 应急响应：抓取现场状态（进程、端口、日志、账号）并归档
-- 审计取证：需要可复核的截图 + 清单，而不是一段随手复制的文本
+采集阶段不依赖本地伪终端：命令输出经 SSH 通道原样取回并落盘为 ANSI 文本，再由 termshot 离屏渲染。因此渲染可离线重做，也不会因本地终端尺寸影响远端输出。
 
-不适用：只是编辑 Excel/报表；只需要拿到命令输出文本（不需要图）时可直接用 ssh。
+## When to use
 
-## 前置条件
+在以下场景优先使用本技能，而不是手工执行命令再复制文本：
 
-- 本机 macOS/Linux（Windows 需在 WSL 或 Git Bash 下用）
-- `paramiko`（Python）
-- `termshot`（Go CLI，负责 ANSI→PNG）
+- 服务器巡检、安全基线核查、加固前后对比
+- 故障排查，需要留下「确实执行过该命令、结果如此」的凭据
+- 应急响应：抓取进程、端口、账号、日志现场并归档
+- 审计与合规取证：交付物需要截图 + 机器可读清单
+- 需要在多台主机上执行同一组命令并统一归档
 
-一键装依赖：
+不要使用本技能的情形：
+
+- 只需要命令输出文本、不需要图片 → 直接 `ssh` 执行
+- 编辑 Excel / Word / 报表 → 使用对应的文档技能
+- 目标主机不可达或没有可用凭据 → 先解决连通性与认证
+
+## Prerequisites
 
 ```bash
+cd ssh-shot            # 目录名须与 name 字段一致
 bash scripts/install.sh
 ```
 
-手动装：
+`install.sh` 创建 `.venv` 安装 paramiko，并安装 termshot（优先 `go install`，否则提示 brew / Release）。后续命令统一用 `.venv/bin/python`（或任意已装 paramiko 的解释器）。
 
-```bash
-uv venv .venv && uv pip install --python .venv/bin/python paramiko
-go install github.com/homeport/termshot/cmd/termshot@latest   # 产物 ~/go/bin/termshot
-```
+自检：`./.venv/bin/python scripts/ssh_shot.py --help` 能打印用法即就绪。
 
-脚本会自动在 `PATH`、`~/go/bin`、`/usr/local/bin`、`/opt/homebrew/bin`、`/usr/bin` 找 termshot，
-也可用 `--termshot /path/to/termshot` 指定。
+## Workflow
 
-## 用法
+1. **确认边界**：主机、账号、认证方式（密码 / 私钥 / agent），以及是否允许写操作。默认只跑只读命令；任何变更类命令（重启服务、改权限、清日志、删文件）必须先取得用户明确授权。
+2. **选择执行源**（可混用，按出现顺序各出一张图）：
 
-```bash
-PY=.venv/bin/python     # 或直接 python3（已装 paramiko）
+   | 场景 | 参数 |
+   | --- | --- |
+   | 少量临时命令 | `-c "cmd"`（可重复） |
+   | 批量巡检、需要稳定编号与备注 | `--commands-json cmds.json` |
+   | 本机写好的脚本，要跑在远端 | `--script ./check.sh` |
+   | 目标机上已有脚本 | `--remote-script /opt/audit/os.sh` |
 
-# 1) 单条/多条命令
-$PY scripts/ssh_shot.py --host 10.0.0.5 -p 'PASS' -c "uname -a; id" -c "ss -lntp"
+3. **执行**：标准调用形态如下，密码省略时脚本会 `getpass` 交互索要（避免明文进入 shell history）。
 
-# 2) 命令清单（推荐批量巡检，格式见 scripts/commands.sample.json）
-$PY scripts/ssh_shot.py --host 10.0.0.5 -p 'PASS' \
-    --commands-json scripts/commands.sample.json -o ./evidence
+   ```bash
+   ./.venv/bin/python scripts/ssh_shot.py \
+       --host <HOST> -u <USER> -p '<PASS>' \
+       -c "uname -a; uptime" \
+       --commands-json scripts/commands.sample.json \
+       -o ./evidence
+   ```
 
-# 3) 本地脚本：上传 → 执行 → 截图 → 默认删远端临时文件
-$PY scripts/ssh_shot.py --host 10.0.0.5 -p 'PASS' --script ./baseline.sh
+4. **核对结果**：观察每条命令的 `exit=`、耗时与字节数；失败或超时会在终端打印 `TIMEOUT` / `FAIL`，并写入清单。
+5. **汇报证据**：向用户给出证据目录、成功/失败计数，以及失败项的原因。截图内已自带命令原文与退出码，无需额外说明格式。
 
-# 4) 远端已有脚本：直接执行（不改动远端任何文件）
-$PY scripts/ssh_shot.py --host 10.0.0.5 -p 'PASS' --remote-script /opt/audit/os.sh
+## Evidence layout
 
-# 5) 私钥 + 非默认端口 + 窄终端
-$PY scripts/ssh_shot.py --host 10.0.0.5 --port 2222 -u ops -i ~/.ssh/id_ed25519 \
-    -c "systemctl status sshd" --cols 160
-
-# 6) 只要文本不要图
-$PY scripts/ssh_shot.py --host 10.0.0.5 -p 'PASS' -c "id" --no-render
-```
-
-密码 `-p` 直传；不传则 `getpass` 交互提示（避免明文进 shell history）。
-
-### 常用参数
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--host` | 必填 | 目标主机 |
-| `--port` / `--user` | 22 / root | |
-| `-p / --password`、`-i / --key` | 交互 | 认证 |
-| `-c` / `--commands-json` | – | 命令（可重复）/ 命令清单 |
-| `--script` / `--remote-script` | – | 本地脚本（上传）/ 远端脚本 |
-| `--shell` | 自动 | 解释器，如 `bash`、`python3`、`"bash -e"` |
-| `--remote-dir` / `--keep-remote` | `/tmp/ssh_shot_<ts>` / 关 | 上传目录 / 保留远端脚本 |
-| `-o / --output` | `./evidence` | 证据根目录 |
-| `--cols` / `--rows` / `--term` | 200 / 60 / xterm-256color | 远端 PTY |
-| `--no-pty` | 关 | 不申请 PTY（无颜色，但不会被 pager 卡住） |
-| `--timeout` | 60 | 单命令超时秒 |
-| `--no-render` / `--render-columns` | 关 / 0 | 只存文本 / 出图列宽 |
-| `--margin` `--padding` `--no-shadow` `--no-decoration` | – | 图片样式 |
-
-## 产物
-
-```
+```text
 evidence/<host>_<YYYYmmdd-HHMMSS>/
-  manifest.json              # 主机、时间、渲染参数、脚本信息、每条命令的退出码/耗时
-  row01.ansi                 # 捕获的原始 ANSI 文本（可重出图）
-  row01.png                  # 截图
-  script.row02.baseline.sh   # 脚本存证副本（sha256 记在 manifest 里）
+  manifest.json              # 目标、渲染参数、脚本信息、逐条结果
+  row01.ansi / row01.png     # 原始 ANSI 文本 + 截图
+  script.row02.baseline.sh   # 脚本存证副本（SHA-256 记在清单）
 ```
 
-每张图自带溯源头：`[row05] 名称 (5/5)` + 彩色提示符行（命令原文）+ 输出 + `[exit 0] (0.12s)`；
-脚本任务多一行 `# uploaded: /本地/路径 sha256: …`。超时为黄字，非零退出为红字。
+每张图自带溯源信息：`[row02] 名称 (2/5)`、彩色提示符行（命令原文）、`[exit 0] (0.03s)`；脚本任务额外一行 `# uploaded: <路径> sha256: …`。超时黄字，非零退出红字。
 
-重出图：`termshot --raw-read row01.ansi --filename row01.png`
-
-退出码：`0` 全成功 / `1` 有命令失败或超时（图仍出） / `2` 环境问题（如 termshot 缺失）。
-
-## 采集规范
-
-- **只读优先**：默认只跑查询类命令；任何写操作先跟用户确认。
-- 每条命令自描述，避免事后无法对应：`clear; echo 'ROW 05'; echo 'COMMAND: ...'; <cmd>; echo 'END ROW 05'`
-  或直接把 `name` 写进 `--commands-json`。
-- 长输出拆成多条（每张图信息量有限），超宽单行用 `--render-columns` 控制。
-- 交互式程序（`less`/`vim`/`top`）会失真：用 `--no-pty` 或 `top -b -n1`、`| cat` 之类非交互写法。
-- 敏感信息（口令、密钥、token）不要进命令，或事后用 `termshot --edit` 删。
-
-## 自测
-
-内置一个最小 SSH 服务端，无需真实远端即可端到端验证（仅监听 127.0.0.1）：
+重新渲染某一页（无需再次连接）：
 
 ```bash
-$PY scripts/fake_sshd.py --port 2222 --password 123456 &
-$PY scripts/ssh_shot.py --host 127.0.0.1 --port 2222 -p 123456 \
-    -c "uname -a; id" --script ./baseline.sh -o /tmp/evidence
+termshot --raw-read evidence/<dir>/row01.ansi --filename row01.png
 ```
+
+退出码：`0` 全部成功，`1` 有命令失败或超时（图仍生成），`2` 环境或参数问题。
+
+## Rules
+
+- **只读优先**。默认采集类命令；写操作需用户显式授权，并在汇报中说明改了什么。
+- **命令可自解释**。批量采集时给每条命令写 `name`，或使用
+  `clear; echo 'ROW 05'; echo 'COMMAND: ...'; <cmd>; echo 'END ROW 05'`，避免事后无法对应。
+- **不落凭据**。密码只存在于进程内存；优先 `-i` 私钥或交互输入，不要在命令行参数里留下口令，也不要写进清单或截图。
+- **敏感输出先裁剪**。结果可能含口令、密钥、令牌时，先调整命令（如 `| sed 's/password=.*/password=***/'`），或对 `.ansi` 用 `termshot --edit` 后再出图。
+- **远端零残留**。`--script` 上传的脚本执行后默认删除；仅在排障需要时使用 `--keep-remote`，并在汇报中说明残留位置。
+- **长输出拆分**。单张图信息量有限：多行输出拆成多条命令，超宽行用 `--render-columns` 约束。
+- **交互式程序会失真**。`less` / `vim` / 全屏 `top` 请改用 `--no-pty`，或 `top -b -n1`、`| cat` 等非交互写法。
+
+## Verification checklist
+
+采集结束前逐项确认：
+
+- [ ] 每条命令都有对应的 `.png`，且图片内容与预期命令一致
+- [ ] `manifest.json` 的 `summary.failed` 为 `0`，或失败项已查明原因并在汇报中说明
+- [ ] 脚本任务的 `sha256` 与运行前记录的哈希一致
+- [ ] 无口令、密钥、令牌出现在截图或清单中
+- [ ] 使用 `--script` 时，远端临时文件已清理（或已说明保留位置）
+
+## References
+
+- [`references/cli.md`](references/cli.md) —— 完整参数表、退出码、`manifest.json` 字段、渲染样式开关
+- [`references/troubleshooting.md`](references/troubleshooting.md) —— 连接失败、字符错乱、分页卡死、SFTP 报错等常见故障
+- [`references/playbooks.md`](references/playbooks.md) —— 基础信息、账号、网络、服务、日志等只读巡检命令组
+- [`scripts/commands.sample.json`](scripts/commands.sample.json) —— 命令清单格式样例
+- [`README.md`](README.md) —— 面向人的完整文档
