@@ -6,6 +6,7 @@
 
 <sub>Run commands or scripts over SSH, render every output as a terminal-style PNG, ship a machine-readable manifest.</sub>
 
+[![Release](https://img.shields.io/github/v/release/rootphantomer/ssh-shot-skill?display_name=tag&sort=semver)](https://github.com/rootphantomer/ssh-shot-skill/releases/latest)
 [![License](https://img.shields.io/github/license/rootphantomer/ssh-shot-skill?color=blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![paramiko](https://img.shields.io/badge/paramiko-3.0%2B-1f425f)](https://www.paramiko.org/)
