@@ -10,6 +10,8 @@ validate_skill.py —— 按 Agent Skills 规范校验本仓库的 SKILL.md
   - license: 可选, 短字符串
   - compatibility: 可选, 1-500 字符
   - metadata: 可选, 字符串到字符串的映射
+  - frontmatter 的 YAML 合法性: 未加引号的 plain scalar 不得含 ": " / " #" / 开头是指示符
+    (否则严格解析器报 Nested mappings… 而 skill 被静默跳过); 装了 PyYAML 时再用它复核一遍
   - 正文非空, 且行数不超过 500 行(超过应考虑拆到 references/)
 
 用法:
@@ -26,6 +28,93 @@ from pathlib import Path
 
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MAX_BODY_LINES = 500
+
+# frontmatter 里 key: value 的行（含缩进的嵌套映射与列表项里的映射）
+MAPPING_LINE_RE = re.compile(r"^(?P<indent>[ \t]*)(?:-[ \t]+)?(?P<key>[^\s:#][^:]*):(?:[ \t]+(?P<value>.*))?$")
+# 未加引号的 plain scalar 里，这些字符会改变 YAML 语义
+PLAIN_SCALAR_HEADS = "[]{},&*!%@`|>"
+
+
+def _frontmatter_lines(text: str) -> list[tuple[int, str]]:
+    """按 (行号, 原始行) 返回 frontmatter 内的行；首行与结束的 --- 不含。"""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return []
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        return []
+    return list(enumerate(lines[1:end], start=2))
+
+
+def check_plain_scalars(text: str) -> list[str]:
+    """检查 frontmatter 里未加引号的 plain scalar 是否含会破坏 YAML 的字符。
+
+    典型翻车写法（真实发生过）:
+        description: … needs screenshot evidence: system inspection, …
+    这里的 ": " 让严格解析器把值当成嵌套映射，报
+        Nested mappings are not allowed in compact mappings at line 2, column 14
+    而只认顶层 key: value 的极简解析器完全看不出来，于是 skill 在校验通过之后
+    才在加载方那里被跳过。同理 " #" 会被当注释截断。
+    """
+    problems: list[str] = []
+    block_indent: int | None = None  # 块标量（| >）的缩进基准
+    for lineno, raw in _frontmatter_lines(text):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        if block_indent is not None:
+            if indent > block_indent:
+                continue  # 还在块标量里
+            block_indent = None
+        m = MAPPING_LINE_RE.match(raw)
+        if not m:
+            continue
+        key = m.group("key").strip()
+        value = (m.group("value") or "").strip()
+        if not value:
+            continue  # 值是嵌套映射 / 列表，下一行才开始
+        if value[0] in "'\"":
+            continue  # 已加引号
+        if value[0] in "|>":
+            block_indent = indent  # 块标量，内容行不再按 plain scalar 检查
+            continue
+        reasons = []
+        if value[0] in PLAIN_SCALAR_HEADS or value.startswith(("- ", "? ")):
+            reasons.append(f"以 YAML 指示符 {value[0]!r} 开头")
+        if ": " in value or value.endswith(":"):
+            reasons.append('含 ": "（会被判成嵌套映射）')
+        if " #" in value:
+            reasons.append('含 " #"（会被当成注释截断）')
+        if "\t" in value:
+            reasons.append("含制表符")
+        if reasons:
+            problems.append(
+                f"第 {lineno} 行 {key} 的值是未加引号的 plain scalar，" + "、".join(reasons) + "; "
+                '请整个值加双引号，或改用块标量（key: |- 下一行起缩进写）'
+            )
+    return problems
+
+
+def check_strict_yaml(text: str) -> list[str]:
+    """装了 PyYAML 就用真正解析器再过一遍（可选，不算依赖）。"""
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ImportError:
+        return []
+    rows = _frontmatter_lines(text)
+    if not rows:
+        return []
+    block = "\n".join(raw for _, raw in rows)
+    try:
+        loaded = yaml.safe_load(block)
+    except yaml.YAMLError as exc:
+        detail = " ".join(str(exc).split())[:200]
+        return [f"严格 YAML 解析失败: {detail}（多为未加引号的 plain scalar 含 \": \"）"]
+    if not isinstance(loaded, dict):
+        return ["严格 YAML 解析结果不是键值映射"]
+    return []
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, object], str, str]:
@@ -70,6 +159,10 @@ def check(skill_dir: Path) -> tuple[list[str], list[str]]:
     meta, body, err = parse_frontmatter(text)
     if err:
         return [err], warnings
+
+    # 极简解析器只看 key: value，看不出 plain scalar 里的 ": " / " #"，这里补两道
+    errors.extend(check_plain_scalars(text))
+    errors.extend(check_strict_yaml(text))
 
     if any(line.lstrip().startswith("<") for line in text.splitlines()[:12]):
         errors.append("frontmatter 中不要使用尖括号 <>（会被渲染成 &lt; &gt;）")
