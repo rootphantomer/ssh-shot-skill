@@ -132,6 +132,7 @@ class Result:
     image_file: str = ""
     columns: int = 0
     error: str = ""
+    collected_at: str = ""   # 采集时刻, 用于图片头部与审计回溯
     timed_out: bool = False
     local_script: str = ""
     remote_script: str = ""
@@ -177,13 +178,15 @@ def sanitize_output(text: str, keep_cr: bool) -> str:
     return text.rstrip("\n") + "\n"
 
 
-def build_header(task: Task, user: str, host: str) -> str:
+def build_header(task: Task, user: str, host: str, collected_at: str = "") -> str:
     """自描述头: 保留命令原文(提示符)与脚本来源, 不额外加行号标签。"""
     prompt = f"{user}@{host}:~$ {task.command}"
     head = (
         f"\x1b[1;32m{user}@{host}\x1b[0m:\x1b[1;34m~\x1b[0m$ "
         f"\x1b[1;37m{task.command}\x1b[0m\n"
     )
+    if collected_at:
+        head += f"\x1b[2m# collected at {collected_at}  host: {user}@{host}\x1b[0m\n"
     if task.sha256:
         origin = task.local_script or task.remote_script
         kind = "uploaded" if task.uploaded else "remote"
@@ -956,8 +959,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for idx, task in enumerate(tasks, 1):
             eprint(f"[{idx}/{len(tasks)}] {task.id}: {task.command.strip().splitlines()[0][:70]}")
+            collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             res, text = run_task(client, task, args)
-            body = build_header(task, args.user, args.host)
+            res.collected_at = collected_at
+            body = build_header(task, args.user, args.host, collected_at)
             body += sanitize_output(text, args.keep_cr)
 
             # 单条 ansi 始终带自己的 footer(取证完整); merge 图稍后只在图尾放一个汇总 footer
