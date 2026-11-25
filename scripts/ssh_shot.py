@@ -10,8 +10,8 @@ ssh_shot.py —— SSH 远程执行命令 + 输出截图取证
 依赖:
     paramiko           (pip install paramiko)
     Pillow >= 10       (非 PNG 格式需要, pip install 'Pillow>=10')
-    termshot >= 0.4    (go install github.com/homeport/termshot/cmd/termshot@latest
-                        或 brew install homeport/tap/termshot)
+    termshot-cjk       随仓库编译, 内置 GB2312 中文字体 (bash scripts/build_termshot.sh);
+                       其他 termshot 0.4+ 可用 --termshot 或 SSH_SHOT_TERMSHOT 指定
 
 用法示例:
     # 单条命令
@@ -65,6 +65,7 @@ except ImportError:  # pragma: no cover
     raise SystemExit(2)
 
 DEFAULT_TERMSHOT_CANDIDATES = (
+    "~/.local/bin/termshot-cjk",
     "~/go/bin/termshot",
     "/usr/local/bin/termshot",
     "/opt/homebrew/bin/termshot",
@@ -153,16 +154,27 @@ def eprint(*args: object) -> None:
 
 
 def find_termshot(explicit: str | None) -> str | None:
-    if explicit:
-        p = Path(explicit).expanduser()
+    def usable(path: str | Path) -> str | None:
+        p = Path(path).expanduser()
         return str(p) if p.is_file() and os.access(p, os.X_OK) else None
-    hit = shutil.which("termshot")
+
+    if explicit:
+        return usable(explicit)
+    env = os.environ.get("SSH_SHOT_TERMSHOT", "").strip()
+    if env:
+        return usable(env)
+    # 优先用仓库内编译的中文版; 没有再退回系统里的普通 termshot
+    repo_cjk = Path(__file__).resolve().parent.parent / ".venv/bin/termshot-cjk"
+    hit = usable(repo_cjk)
+    if hit:
+        return hit
+    hit = shutil.which("termshot-cjk") or shutil.which("termshot")
     if hit:
         return hit
     for cand in DEFAULT_TERMSHOT_CANDIDATES:
-        p = Path(cand).expanduser()
-        if p.is_file() and os.access(p, os.X_OK):
-            return str(p)
+        hit = usable(cand)
+        if hit:
+            return hit
     return None
 
 

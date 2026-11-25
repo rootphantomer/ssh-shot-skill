@@ -76,7 +76,7 @@
 | Python | 3.9+ | 仅用于本机脚本（远端无需 Python） |
 | [paramiko](https://www.paramiko.org/) | 3.0+ | SSH / SFTP 客户端 |
 | [Pillow](https://python-pillow.github.io/) | 10+ | PNG → jpeg / webp / bmp 转换、固定画布宽度（出图必需） |
-| [termshot](https://github.com/homeport/termshot) | 0.4+ | ANSI → PNG 渲染器（Go CLI） |
+| [termshot-cjk](https://github.com/homeport/termshot) | v0.6.1 + 内置字体 | ANSI → PNG 渲染器；由本仓库编译，内嵌 GB2312 中文字体（编译需 Go 1.24+） |
 | 操作系统 | macOS / Linux | Windows 请使用 WSL 或 Git Bash |
 
 ## 安装
@@ -88,7 +88,7 @@ git clone https://github.com/rootphantomer/ssh-shot-skill.git && cd ssh-shot-ski
 bash scripts/install.sh
 ```
 
-`install.sh` 会创建 `.venv` 并安装 paramiko 与 Pillow，然后安装 termshot：优先 `go install`，没有 Go 则提示使用 Homebrew 或下载 Release。
+`install.sh` 会创建 `.venv` 并安装 paramiko 与 Pillow，然后调用 `scripts/build_termshot.sh` 编译 `.venv/bin/termshot-cjk`（内嵌裁剪版 Sarasa Mono SC 字体，中文不再变方框）。编译只在安装阶段需要 Go 1.24+；已存在二进制时会跳过。
 
 ### 手动安装
 
@@ -97,12 +97,11 @@ bash scripts/install.sh
 uv venv .venv && uv pip install --python .venv/bin/python 'paramiko>=3.0' 'Pillow>=10'
 python3 -m venv .venv && ./.venv/bin/python -m pip install 'paramiko>=3.0' 'Pillow>=10'
 
-# 2) termshot（任选其一）
-go install github.com/homeport/termshot/cmd/termshot@latest   # 产物位于 $(go env GOPATH)/bin/termshot
-brew install homeport/tap/termshot
+# 2) 编译带中文字体的 termshot-cjk（需 Go 1.24+）
+bash scripts/build_termshot.sh    # 产物: .venv/bin/termshot-cjk
 ```
 
-脚本会在 `PATH`、`~/go/bin`、`/usr/local/bin`、`/opt/homebrew/bin`、`/usr/bin` 中查找 termshot；也可以用 `--termshot /path/to/termshot` 显式指定。
+渲染器查找顺序：`--termshot` → 环境变量 `SSH_SHOT_TERMSHOT` → `.venv/bin/termshot-cjk` → `PATH`（优先 `termshot-cjk`）→ `~/go/bin`、`/usr/local/bin`、`/opt/homebrew/bin`、`/usr/bin`。若退回普通 termshot（默认 Hack 字体），截图中的中文会显示为方框。
 
 ## 快速开始
 
@@ -270,7 +269,7 @@ $PY scripts/ssh_shot.py --host 10.0.0.5 -p 'PASS' --remote-script /opt/audit/os.
 | --- | --- | --- |
 | `-o, --output` | `./evidence` | 证据根目录（批量模式下为图片输出目录，不存在则新建） |
 | `--hosts-file` | – | 主机清单纯文本（每行 `ip user password`），批量对多台执行同一批命令 |
-| `--termshot` | 自动查找 | termshot 可执行文件路径 |
+| `--termshot` | 自动查找 | termshot 可执行文件路径（优先 `.venv/bin/termshot-cjk`） |
 | `--no-render` | 关 | 只保存 `.ansi`，不出图 |
 | `--width-source` | `screen` | 宽度基准：`screen`=本机最大屏幕物理像素（默认），`terminal`=当前终端列数 |
 | `--merge` | 关 | 多条命令按序执行后，把输出拼成**一张图**（不再逐条出图）；图尾只保留**一个汇总** exit（最差状态 + 总耗时） |
@@ -313,7 +312,7 @@ evidence/
   "tool": "ssh_shot.py",
   "created_at": "2026-11-18T11:08:52",
   "target": { "host": "10.0.0.5", "port": 22, "user": "root" },
-  "render": { "termshot": "/usr/local/bin/termshot", "pty": true, "cols": 200, "rows": 60,
+  "render": { "termshot": "/path/to/.venv/bin/termshot-cjk", "pty": true, "cols": 200, "rows": 60,
               "format": "jpeg", "quality": 90, "background": "auto", "clip_canvas": true, "shadow": false,
               "width_source": {"source": "screen", "screen_px": 3072, "columns": 103}, "merge": false },
   "scripts": { "remote_dir": "/tmp/ssh_shot_20261118-110852", "kept": false, "uploaded": ["/tmp/ssh_shot_20261118-110852/baseline.sh"] },
@@ -338,7 +337,7 @@ evidence/
 重新渲染任意一页（无需再次连接目标机）：
 
 ```bash
-termshot --raw-read evidence/10.0.0.5_20261118-110852/row01.ansi \
+./.venv/bin/termshot-cjk --raw-read evidence/10.0.0.5_20261118-110852/row01.ansi \
          --filename /tmp/row01.png
 
 # termshot 只出 PNG；若要 jpeg，需先铺底色再转（底色见 manifest.render.background）
@@ -365,13 +364,13 @@ bg.save('row01.jpg', quality=90)"
                       │
                       │ ③ 加上溯源头（命令原文 / sha256 / exit / 耗时）
                       ▼
-                row01.ansi ──④ termshot --raw-read──▶ 临时 PNG
+                row01.ansi ──④ termshot-cjk --raw-read─▶ 临时 PNG
                       │                                  │
                       │                                  └─⑤ Pillow 转换 ──▶ row01.jpg
                       └──⑥ 汇总 ──▶ manifest.json
 ```
 
-不依赖本地伪终端，也不在远端启动任何常驻进程：命令输出经 SSH 通道原样取回，落盘为 ANSI 文本，再由 termshot 离屏渲染。因此渲染阶段可离线重做，也不会因为本地终端尺寸影响远端输出。
+不依赖本地伪终端，也不在远端启动任何常驻进程：命令输出经 SSH 通道原样取回，落盘为 ANSI 文本，再由 termshot-cjk 离屏渲染。因此渲染阶段可离线重做，也不会因为本地终端尺寸影响远端输出。
 
 ## 作为 Agent Skill 使用
 
@@ -420,7 +419,8 @@ python3 scripts/validate_skill.py .
 
 - 交互式程序（`less`、`vim`、`top` 全屏模式）在截图中会失真，请改用 `--no-pty` 或 `top -b -n1`、`| cat` 等非交互写法。
 - termshot 只能输出 PNG；jpeg / bmp 没有 alpha，透明区域按 `--image-background` 铺底（默认取截图自带深色，不是白底），png / webp 保留透明。
-- 列宽默认按本机最大屏幕物理像素换算（约 3072px→103 列，运行时校准），也可用 `--width-source terminal` 跟随当前终端列数；拿不到时用内容自适应（45–120 列）。终端框铺满画布、无阴影、无额外背景；超长行由 termshot 折行（内容不丢）。
+- 列宽默认按本机最大屏幕物理像素换算（约 3072px→103 列，运行时校准），也可用 `--width-source terminal` 跟随当前终端列数；拿不到时用内容自适应（45–120 列）。终端框铺满画布、无阴影、无额外背景；超长行由 termshot-cjk 折行（内容不丢）。
+- `termshot-cjk` 内嵌的字体覆盖 GB2312 常用简体中文；生僻字/繁体/日文会显示为方框。四种字重共用一份字形，粗体/斜体效果不区分。
 - 需要严格分栏时用 `--render-columns` 手动指定列数。
 - 远端登录 banner、`TMOUT` 提示会出现在输出顶部（属真实情况，不做过滤）。
 - `manifest.json` 中的 SHA-256 只覆盖脚本内容，不覆盖输出内容；如需完整性证明，请对证据目录整体做签名。
@@ -463,5 +463,6 @@ python3 scripts/validate_skill.py .
 ## 致谢
 
 - [termshot](https://github.com/homeport/termshot) —— 把 ANSI 渲染成终端风格图片的核心
+- [Sarasa Gothic](https://github.com/be5invis/Sarasa-Gothic) —— 内嵌字体来源（SIL OFL 1.1，裁剪说明见 `assets/fonts/`）
 - [paramiko](https://www.paramiko.org/) —— 纯 Python 的 SSH / SFTP 实现
 - [Pillow](https://python-pillow.github.io/) —— PNG → jpeg / webp / bmp 的格式转换、压缩与固定宽度画布

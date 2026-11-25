@@ -50,7 +50,7 @@
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-o, --output` | `./evidence` | 证据根目录 |
-| `--termshot` | 自动查找 | termshot 可执行文件路径 |
+| `--termshot` | 自动查找 | termshot 可执行文件路径（优先 `.venv/bin/termshot-cjk`） |
 | `--no-render` | 关 | 只保存 `.ansi`，不出图 |
 | `--width-source` | `screen` | 宽度基准：`screen`=本机最大屏幕物理像素（默认），`terminal`=当前终端列数 |
 | `--merge` | 关 | 多命令按序执行、输出拼接成单张 `merged.<ext>`（不逐条出图）；图尾仅一个汇总 exit/error/timeout（最差状态 + 总耗时） |
@@ -62,7 +62,9 @@
 | `--image-quality` | `90` | 有损格式质量 1–100，对 jpg / jpeg / webp 生效 |
 | `--image-background` | `auto` | 底色：`auto` / `black` / `white` / `#RRGGBB`；默认取截图自带深色，不铺白底（仅 jpg/jpeg/bmp 用到） |
 
-termshot 自动查找顺序：`PATH` → `~/go/bin` → `/usr/local/bin` → `/opt/homebrew/bin` → `/usr/bin`。
+渲染器查找顺序：`--termshot` → 环境变量 `SSH_SHOT_TERMSHOT` → `.venv/bin/termshot-cjk` → `PATH` → `~/go/bin` → `/usr/local/bin` → `/opt/homebrew/bin` → `/usr/bin`。
+
+`termshot-cjk` 由 `bash scripts/build_termshot.sh` 编译（需 Go 1.24+），内嵌裁剪版 Sarasa Mono SC 字体，覆盖 GB2312 中文；四种字重共用一份字形，粗体/斜体不区分。若只找到普通 termshot（Hack 字体），中文会显示为方框。
 
 ## 命令清单格式
 

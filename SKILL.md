@@ -2,10 +2,10 @@
 name: ssh-shot
 description: "通过 SSH 在远端 Linux/Unix 主机上执行命令或脚本，并把每条命令的完整输出（含 ANSI 颜色）用 termshot 渲染成终端风格截图（png / jpg / jpeg / webp / bmp，默认 jpeg），同时生成 manifest.json 归档（命令原文、退出码、耗时、脚本 SHA-256）。适用于服务器巡检、安全基线核查、故障排查、应急响应验证、审计取证，以及任何需要「命令输出截图」作为证据的场合。Use when a task needs SSH command or script execution on a remote Linux/Unix host together with screenshot evidence: system inspection, security baseline checks, troubleshooting, incident-response verification, audit evidence collection, or when the user asks for command-output screenshots."
 license: MIT
-compatibility: 需要本机 Python 3.9+、paramiko、Pillow 10+（出图必需，或使用 scripts/install.sh 自动安装）、termshot CLI（Go，0.4+），以及到目标主机的 SSH 网络连通性与可用凭据。不依赖远端安装任何软件；Windows 需在 WSL 或 Git Bash 下运行。
+compatibility: 需要本机 Python 3.9+、paramiko、Pillow 10+（出图必需，或使用 scripts/install.sh 自动安装）、termshot-cjk（由 scripts/install.sh 编译，内嵌 GB2312 中文字体；编译需 Go 1.24+），以及到目标主机的 SSH 网络连通性与可用凭据。不依赖远端安装任何软件；Windows 需在 WSL 或 Git Bash 下运行。
 metadata:
   author: rootphantomer
-  version: "2.0.0"
+  version: "2.0.1"
   repository: https://github.com/rootphantomer/ssh-shot-skill
 ---
 
@@ -40,7 +40,7 @@ cd ssh-shot            # 目录名须与 name 字段一致
 bash scripts/install.sh
 ```
 
-`install.sh` 创建 `.venv` 安装 paramiko 与 Pillow，并安装 termshot（优先 `go install`，否则提示 brew / Release）。后续命令统一用 `.venv/bin/python`（或任意已装 paramiko / Pillow 的解释器）。
+`install.sh` 创建 `.venv` 安装 paramiko 与 Pillow，并调用 `scripts/build_termshot.sh` 编译出 `.venv/bin/termshot-cjk`（内嵌裁剪版 Sarasa Mono SC，支持 GB2312 中文；Go 1.24+ 仅安装阶段需要）。后续命令统一用 `.venv/bin/python`（或任意已装 paramiko / Pillow 的解释器）。
 
 自检：`./.venv/bin/python scripts/ssh_shot.py --help` 能打印用法即就绪。
 
@@ -90,7 +90,7 @@ evidence/<host>_<YYYYmmdd-HHMMSS>/
 
 ```bash
 # termshot 只能出 PNG；非 PNG 格式须再按 manifest.render.background 铺底转换
-termshot --raw-read evidence/<dir>/row01.ansi --filename /tmp/row01.png
+./.venv/bin/termshot-cjk --raw-read evidence/<dir>/row01.ansi --filename /tmp/row01.png
 ```
 
 退出码：`0` 全部成功，`1` 有命令失败或超时（图仍生成），`2` 环境或参数问题。

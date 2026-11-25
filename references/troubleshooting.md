@@ -27,6 +27,10 @@
 远端 `TERM` 异常或输出含 termshot 无法解析的控制序列。
 处理：显式 `--term xterm-256color`；仍异常时加 `--no-pty`（牺牲颜色换正确性），或命令里去掉 `--color=always`。
 
+**中文变成方框 `□`（ASCII 正常）**
+渲染器用了普通 termshot（内置 Hack 字体不含中文字形），不是仓库编译的 `termshot-cjk`。
+处理：先确认 `manifest.json` 的 `render.termshot` 是否指向 `.venv/bin/termshot-cjk`；若不是，安装 Go 1.24+ 后执行 `bash scripts/build_termshot.sh`，或用 `--termshot` / `SSH_SHOT_TERMSHOT` 指向已编译的二进制。若 `.ansi` 文件里的中文本身就是 `?` 或替换符，则是远端编码问题（如 GBK 输出被按 UTF-8 解码），换字体无效。
+
 **图里行被截断、或大段空白**
 `--render-columns` 同时固定了换行与画布宽度。去掉该参数让 termshot 自适应，或调到接近真实行宽。
 
@@ -61,7 +65,7 @@ go install github.com/homeport/termshot/cmd/termshot@latest   # 产物在 $(go e
 brew install homeport/tap/termshot
 ```
 
-或用 `--termshot /path/to/termshot` 指定。也可先 `--no-render` 只留 `.ansi`，事后补出图。
+或用 `--termshot /path/to/termshot`（建议指向 `.venv/bin/termshot-cjk`）指定，也可设置 `SSH_SHOT_TERMSHOT`。还可先 `--no-render` 只留 `.ansi`，事后补出图。
 
 **`go install` 卡在 `sum.golang.org` 超时**
 校验服务不可达。改用 `GOSUMDB=off go install ...`，或直接下载 Release 二进制放入 `PATH`。
